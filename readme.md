@@ -12,7 +12,7 @@ TelegramFS `tgfuse` is a FUSE-based filesystem that allows you to mount a Telegr
 2. **Download Dependencies**: Download the required dependencies into the Virtual Environment `venv` using `uv`.
 
 ```shell
-git clone https://github.com/grisha765/tgfuse.git
+git clone https://github.com/ergolyam/tgfuse.git
 cd tgfuse
 python -m venv .venv
 .venv/bin/python -m pip install uv
