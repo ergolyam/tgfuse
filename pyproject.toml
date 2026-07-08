@@ -11,6 +11,9 @@ dependencies = [
     "tgcrypto-pyrofork>=1.2.7",
 ]
 
+[project.scripts]
+tgfuse = "tgfuse.__main__:run"
+
 [tool.pyright]
 venvPath = '.'
 venv = '.venv'

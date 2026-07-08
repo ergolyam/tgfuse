@@ -39,7 +39,8 @@ python -m venv .venv
     TG_HASH="your_telegram_api_hash"
     TG_TOKEN="your_telegram_bot_token" # if you don't have one, it's userbot.
     CHAT_ID="your_channel_id"
-    CACHE="True"
+    TG_UPLOAD_WORKERS="4" # parallel Telegram upload workers for large files
+    TG_UPLOAD_BUFFER_PARTS="16" # queued 512 KiB upload parts kept in memory
     FTP="True" # very unstable, not recommended at the moment
     ```
 
@@ -48,9 +49,8 @@ python -m venv .venv
 - **Channel as network drive**: Mount a Telegram channel as a local directory using pyfuse3.
 - **Read-only or read/write**: If you have permissions to send messages in the specified chat/channel, the filesystem will act in read-write mode. Otherwise, it automatically becomes read-only.
 - **Automatic synchronization**: Periodically checks for new/removed files in the Telegram chat and updates the mounted filesystem accordingly.
-- **Lazy downloads**: Files are only downloaded from Telegram when they are opened/read.
+- **Lazy streamed downloads**: Files are read from Telegram on demand with bounded read-ahead for sequential media playback.
 - **On-demand uploads**: When creating or modifying files, they are uploaded back to the Telegram chat.
-- **Сustomizable cache**: Enable or disable caching in RAM.
 - **Multiple Client Support**: Enjoy the flexibility to connect to Telegram in two distinct ways.
     - **Userbot Support**: Use your personal Telegram account (userbot) to access all available features when needed.  
     - **Bot Token Support**: Alternatively, utilize a dedicated bot token for accessing Telegram content, offering a robust and controlled method for managing your channels.

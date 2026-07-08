@@ -17,7 +17,7 @@ async def init():
     chat_id = Config.chat_id
     args = sys.argv[1:]
     if not api_id or not api_hash:
-        log.error("Please set TG_API and TG_HASH environment variables.")
+        log.error("Please set TG_ID and TG_HASH environment variables.")
         sys.exit(1)
     if len(args) != 1:
         log.error("You need to set the mount path")
@@ -51,7 +51,7 @@ async def init():
         read = not can_write
         log.info("Read-only mode: %s", read)
 
-        fs = TelegramFS(app, chat_id, read_only=read, cache_enabled=Config.cache)
+        fs = TelegramFS(app, chat_id, read_only=read)
         await fs.init_fs()
 
         fuse_opts = set(pyfuse3.default_options)
