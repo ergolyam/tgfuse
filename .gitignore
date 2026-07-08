@@ -12,3 +12,7 @@ wheels/
 
 # dot environments
 .env
+
+# markdown
+*.md
+!readme.md
