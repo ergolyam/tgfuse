@@ -216,6 +216,7 @@ async def send_document_from_path(
     file_path: str,
     file_name: str,
     file_size: int,
+    caption: str = "",
 ):
     if file_size >= FAST_UPLOAD_MIN_SIZE:
         uploaded = await save_big_file_from_path(
@@ -242,7 +243,7 @@ async def send_document_from_path(
                 raw.functions.messages.SendMedia(
                     peer=await client.resolve_peer(chat_id),
                     media=media,
-                    message="",
+                    message=caption,
                     random_id=client.rnd_id(),
                 )
             )

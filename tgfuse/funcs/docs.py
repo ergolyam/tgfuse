@@ -3,7 +3,7 @@ from pyrogram.errors import FloodWait, RPCError
 from pyrogram.enums import MessagesFilter
 from tgfuse.config import logging_config
 from tgfuse.funcs.floodwait import sleep_for_flood_wait, retry_flood_wait
-from tgfuse.funcs.media import remote_file_from_message
+from tgfuse.funcs.media import remote_entry_from_message
 log = logging_config.setup_logging(__name__)
 
 async def gather_docs_bot(client: Client, chat_id: int) -> list:
@@ -40,10 +40,10 @@ async def gather_docs_bot(client: Client, chat_id: int) -> list:
             if not msg or msg.empty:
                 continue
             found_any_messages = True
-            remote_file = remote_file_from_message(msg)
-            if remote_file:
-                f_id, fname_b, size, t = remote_file
-                all_docs.append((msg.id, f_id, fname_b, size, t))
+            remote_entry = remote_entry_from_message(msg)
+            if remote_entry:
+                f_id, fname_b, size, t, metadata = remote_entry
+                all_docs.append((msg.id, f_id, fname_b, size, t, metadata))
         
         if not found_any_messages:
             empty_chunk_count += 1
@@ -67,12 +67,12 @@ async def gather_docs_userbot(client: Client, chat_id: int) -> list:
         all_docs = []
         try:
             async for msg in client.search_messages(chat_id, filter=MessagesFilter.DOCUMENT):
-                remote_file = remote_file_from_message(msg)
-                if not remote_file:
+                remote_entry = remote_entry_from_message(msg)
+                if not remote_entry:
                     continue
 
-                f_id, fname_b, size, t = remote_file
-                all_docs.append((msg.id, f_id, fname_b, size, t))
+                f_id, fname_b, size, t, metadata = remote_entry
+                all_docs.append((msg.id, f_id, fname_b, size, t, metadata))
             return all_docs
         except FloodWait as exc:
             await sleep_for_flood_wait(exc, label="search userbot documents")

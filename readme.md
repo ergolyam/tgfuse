@@ -49,6 +49,7 @@ python -m venv .venv
 - **Channel as network drive**: Mount a Telegram channel as a local directory using pyfuse3.
 - **Read-only or read/write**: If you have permissions to send messages in the specified chat/channel, the filesystem will act in read-write mode. Otherwise, it automatically becomes read-only.
 - **Automatic synchronization**: Periodically checks for new/removed files in the Telegram chat and updates the mounted filesystem accordingly.
+- **Persistent directories**: Nested and empty directories are restored from versioned metadata stored in Telegram document captions.
 - **Lazy streamed downloads**: Files are read from Telegram on demand with bounded read-ahead for sequential media playback.
 - **On-demand uploads**: When creating or modifying files, they are uploaded back to the Telegram chat.
 - **Multiple Client Support**: Enjoy the flexibility to connect to Telegram in two distinct ways.

@@ -6,6 +6,7 @@ import shutil
 import stat
 import tempfile
 import time
+import uuid
 from collections import OrderedDict
 from typing import Sequence, Tuple
 
@@ -18,7 +19,14 @@ from tgfuse.config import logging_config
 from tgfuse.funcs.channel import gather_all_docs
 from tgfuse.funcs.download import RawDocumentDownloader
 from tgfuse.funcs.floodwait import sleep_for_flood_wait, retry_flood_wait
-from tgfuse.funcs.media import remote_file_from_message
+from tgfuse.funcs.media import (
+    DIRECTORY_MARKER_NAME,
+    ROOT_DIRECTORY_ID,
+    build_directory_caption,
+    build_file_caption,
+    remote_entry_from_message,
+    remote_file_from_message,
+)
 from tgfuse.funcs.upload import send_document_from_path
 
 pyfuse3.asyncio.enable()
@@ -45,7 +53,8 @@ class TelegramFS(pyfuse3.Operations):
         self._root_inode = ROOT_INODE
         self._next_inode = 2
 
-        self._name_to_inode: dict[bytes, int] = {}
+        self._name_to_inode: dict[tuple[int, bytes], int] = {}
+        self._directory_id_to_inode: dict[str, int] = {}
         self._msg_id_to_inode: dict[int, int] = {}
         self._suppressed_msg_ids: set[int] = set()
         self._pending_remote_delete_msg_ids: set[int] = set()
@@ -138,23 +147,137 @@ class TelegramFS(pyfuse3.Operations):
 
     async def _sync_initial_docs(self):
         log.info("Initial sync: gather existing docs from channel...")
-        docs = await gather_all_docs(self._tg_client, self._chat_id)
-        for (m_id, f_id, fname_b, size, ts) in docs:
+        docs = [self._normalize_remote_doc(doc) for doc in await gather_all_docs(
+            self._tg_client, self._chat_id
+        )]
+        self._add_remote_docs(docs)
+
+        log.info("Initial sync done, loaded %s entries.", len(self._files))
+
+    def _normalize_remote_doc(self, doc) -> tuple:
+        if len(doc) == 5:
+            return (*doc, None)
+        return tuple(doc)
+
+    def _add_remote_docs(self, docs: list[tuple]):
+        directory_docs = self._newest_directory_docs(docs)
+        for doc in docs:
+            metadata = doc[5]
+            if (
+                metadata
+                and metadata.get("kind") == "directory"
+                and directory_docs.get(metadata["directory_id"]) != doc
+            ):
+                self._suppressed_msg_ids.add(doc[0])
+        pending = list(directory_docs.values())
+        while pending:
+            added = []
+            for doc in pending:
+                metadata = doc[5]
+                if (
+                    metadata["parent_id"] == ROOT_DIRECTORY_ID
+                    or metadata["parent_id"] in self._directory_id_to_inode
+                ):
+                    self._add_remote_doc(doc)
+                    added.append(doc)
+            if not added:
+                for doc in pending:
+                    log.warning(
+                        "Directory %s has a missing or cyclic parent; exposing it in root.",
+                        doc[5]["directory_id"],
+                    )
+                    doc = (*doc[:5], {**doc[5], "parent_id": ROOT_DIRECTORY_ID})
+                    self._add_remote_doc(doc)
+                break
+            pending = [doc for doc in pending if doc not in added]
+
+        for doc in docs:
+            metadata = doc[5]
+            if metadata and metadata.get("kind") == "directory":
+                continue
+            self._add_remote_doc(doc)
+
+    def _newest_directory_docs(self, docs: list) -> dict[str, tuple]:
+        newest = {}
+        for doc in docs:
+            metadata = doc[5]
+            if not metadata or metadata.get("kind") != "directory":
+                continue
+            directory_id = metadata["directory_id"]
+            if directory_id not in newest or doc[0] > newest[directory_id][0]:
+                newest[directory_id] = doc
+        return newest
+
+    def _parent_inode_for_id(self, directory_id: str) -> int:
+        if directory_id == ROOT_DIRECTORY_ID:
+            return self._root_inode
+        return self._directory_id_to_inode.get(directory_id, self._root_inode)
+
+    def _directory_id_for_parent(self, parent_inode: int) -> str:
+        if parent_inode == self._root_inode:
+            return ROOT_DIRECTORY_ID
+        info = self._files.get(parent_inode)
+        if not info or info.get("kind") != "directory":
+            raise FUSEError(errno.ENOTDIR)
+        return info["directory_id"]
+
+    def _add_remote_doc(self, doc):
+        m_id, f_id, fname_b, size, ts, metadata = doc
+        if metadata and metadata.get("kind") == "directory":
+            directory_id = metadata["directory_id"]
+            existing_inode = self._directory_id_to_inode.get(directory_id)
+            if existing_inode is not None:
+                info = self._files[existing_inode]
+                if m_id <= (info.get("message_id") or 0):
+                    return
+                old_key = (info["parent_inode"], info["file_name"])
+                parent_inode = self._parent_inode_for_id(metadata["parent_id"])
+                self._name_to_inode.pop(old_key, None)
+                name = self._unique_file_name(parent_inode, metadata["name"])
+                old_msg_id = info.get("message_id")
+                if old_msg_id:
+                    self._msg_id_to_inode.pop(old_msg_id, None)
+                    self._suppressed_msg_ids.add(old_msg_id)
+                info.update(
+                    message_id=m_id,
+                    file_id=f_id,
+                    file_name=name,
+                    parent_inode=parent_inode,
+                    timestamp=ts,
+                )
+                self._name_to_inode[(parent_inode, name)] = existing_inode
+                self._msg_id_to_inode[m_id] = existing_inode
+                return
+
+            parent_inode = self._parent_inode_for_id(metadata["parent_id"])
+            name = self._unique_file_name(parent_inode, metadata["name"])
             inode = self._next_inode
             self._next_inode += 1
-
-            unique_fname = self._unique_file_name(fname_b)
+            self._files[inode] = self._new_directory_info(
+                message_id=m_id,
+                file_id=f_id,
+                file_name=name,
+                parent_inode=parent_inode,
+                directory_id=directory_id,
+                timestamp=ts,
+            )
+            self._directory_id_to_inode[directory_id] = inode
+        else:
+            parent_id = metadata["parent_id"] if metadata else ROOT_DIRECTORY_ID
+            parent_inode = self._parent_inode_for_id(parent_id)
+            name = self._unique_file_name(parent_inode, fname_b)
+            inode = self._next_inode
+            self._next_inode += 1
             self._files[inode] = self._new_file_info(
                 message_id=m_id,
                 file_id=f_id,
-                file_name=unique_fname,
+                file_name=name,
+                parent_inode=parent_inode,
                 size=size,
                 timestamp=ts,
             )
-            self._name_to_inode[unique_fname] = inode
-            self._msg_id_to_inode[m_id] = inode
-
-        log.info("Initial sync done, loaded %s files.", len(self._files))
+        self._name_to_inode[(parent_inode, name)] = inode
+        self._msg_id_to_inode[m_id] = inode
 
     async def _periodic_sync_task(self):
         """Runs every 30s, checks for new/removed docs in the channel."""
@@ -171,25 +294,30 @@ class TelegramFS(pyfuse3.Operations):
     def _remote_doc_from_message(self, msg):
         return remote_file_from_message(msg)
 
+    def _remote_entry_from_message(self, msg):
+        return remote_entry_from_message(msg)
+
     async def _fetch_remote_doc_by_msg_id(self, msg_id: int):
         msg = await self._retry_flood_wait(
             f"fetch known msg_id={msg_id}",
             lambda: self._tg_client.get_messages(self._chat_id, msg_id),
         )
-        return self._remote_doc_from_message(msg)
+        return self._remote_entry_from_message(msg)
 
     async def _sync_channel_updates(self):
         """Add new docs & remove missing docs from local state."""
         log.debug("Syncing channel updates...")
-        docs = await gather_all_docs(self._tg_client, self._chat_id)
+        docs = [self._normalize_remote_doc(doc) for doc in await gather_all_docs(
+            self._tg_client, self._chat_id
+        )]
         current_msgs = {}
         seen_msg_ids = set()
-        for (m_id, f_id, fname_b, size, ts) in docs:
+        for (m_id, f_id, fname_b, size, ts, metadata) in docs:
             seen_msg_ids.add(m_id)
             if m_id in self._suppressed_msg_ids:
                 log.debug("Ignoring locally deleted stale msg_id=%s from channel sync.", m_id)
                 continue
-            current_msgs[m_id] = (f_id, fname_b, size, ts)
+            current_msgs[m_id] = (f_id, fname_b, size, ts, metadata)
         self._suppressed_msg_ids.intersection_update(
             seen_msg_ids | self._pending_remote_delete_msg_ids
         )
@@ -205,7 +333,15 @@ class TelegramFS(pyfuse3.Operations):
             new_msg_ids.add(msg_id)
             log.debug("Kept known msg_id=%s after direct sync check.", msg_id)
 
-        for msg_id in old_msg_ids - new_msg_ids:
+        missing_msg_ids = sorted(
+            old_msg_ids - new_msg_ids,
+            key=lambda msg_id: (
+                self._files.get(self._msg_id_to_inode[msg_id], {}).get("kind")
+                == "directory",
+                -self._inode_depth(self._msg_id_to_inode[msg_id]),
+            ),
+        )
+        for msg_id in missing_msg_ids:
             inode = self._msg_id_to_inode[msg_id]
             info = self._files.get(inode)
             if not info:
@@ -214,26 +350,26 @@ class TelegramFS(pyfuse3.Operations):
                 log.debug("Skipping removal inode=%s, msg_id=%s because busy.", inode, msg_id)
                 continue
             fname = info["file_name"]
+            key = (info["parent_inode"], fname)
+            if info.get("kind") == "directory" and self._directory_not_empty(inode):
+                self._msg_id_to_inode.pop(msg_id, None)
+                info["message_id"] = None
+                info["file_id"] = None
+                log.warning("Directory marker removed for non-empty inode=%s.", inode)
+                continue
             log.info("Doc removed => inode=%s name=%s.", inode, fname)
             self._files.pop(inode, None)
-            self._name_to_inode.pop(fname, None)
+            self._name_to_inode.pop(key, None)
+            if info.get("kind") == "directory":
+                self._directory_id_to_inode.pop(info["directory_id"], None)
             self._msg_id_to_inode.pop(msg_id, None)
 
-        for msg_id in new_msg_ids - old_msg_ids:
-            (f_id, fname_b, size, ts) = current_msgs[msg_id]
-            inode = self._next_inode
-            self._next_inode += 1
-            unique_fname = self._unique_file_name(fname_b)
-            self._files[inode] = self._new_file_info(
-                message_id=msg_id,
-                file_id=f_id,
-                file_name=unique_fname,
-                size=size,
-                timestamp=ts,
-            )
-            self._name_to_inode[unique_fname] = inode
-            self._msg_id_to_inode[msg_id] = inode
-            log.info("New doc => inode=%s, name=%s, msg_id=%s", inode, unique_fname, msg_id)
+        new_docs = [
+            (msg_id, *current_msgs[msg_id]) for msg_id in new_msg_ids - old_msg_ids
+        ]
+        self._add_remote_docs(new_docs)
+        for doc in new_docs:
+            log.info("New remote entry msg_id=%s", doc[0])
 
         log.debug("Channel sync complete.")
 
@@ -243,14 +379,17 @@ class TelegramFS(pyfuse3.Operations):
         message_id: int | None,
         file_id: str | None,
         file_name: bytes,
+        parent_inode: int,
         size: int,
         timestamp: int | None = None,
         refcount: int = 0,
     ) -> dict:
         return {
             "message_id": message_id,
+            "kind": "file",
             "file_id": file_id,
             "file_name": file_name,
+            "parent_inode": parent_inode,
             "size": size,
             "timestamp": int(time.time()) if timestamp is None else timestamp,
             "data": bytearray(),
@@ -264,14 +403,52 @@ class TelegramFS(pyfuse3.Operations):
             "mode": 0o644,
         }
 
-    def _unique_file_name(self, fname: bytes) -> bytes:
+    def _new_directory_info(
+        self,
+        *,
+        message_id: int | None,
+        file_id: str | None,
+        file_name: bytes,
+        parent_inode: int,
+        directory_id: str,
+        timestamp: int | None = None,
+    ) -> dict:
+        return {
+            "message_id": message_id,
+            "kind": "directory",
+            "file_id": file_id,
+            "file_name": file_name,
+            "parent_inode": parent_inode,
+            "directory_id": directory_id,
+            "size": 0,
+            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "dirty": False,
+            "refcount": 0,
+            "read_only": False,
+            "pending_delete_message_ids": set(),
+            "unlinked": False,
+            "mode": 0o755,
+        }
+
+    def _unique_file_name(self, parent_inode: int, fname: bytes) -> bytes:
         """If conflict, append _2, _3, etc."""
         base = fname
         idx = 2
-        while fname in self._name_to_inode:
+        while (parent_inode, fname) in self._name_to_inode:
             fname = base + f"_{idx}".encode("utf-8")
             idx += 1
         return fname
+
+    def _directory_not_empty(self, inode: int) -> bool:
+        return any(parent_inode == inode for parent_inode, _ in self._name_to_inode)
+
+    def _inode_depth(self, inode: int) -> int:
+        depth = 0
+        info = self._files.get(inode)
+        while info and info.get("parent_inode") != self._root_inode:
+            depth += 1
+            info = self._files.get(info["parent_inode"])
+        return depth
 
     def _is_temp_name(self, name: bytes) -> bool:
         return (
@@ -628,6 +805,48 @@ class TelegramFS(pyfuse3.Operations):
         task = asyncio.create_task(self._delete_remote_messages(msg_ids))
         self._remote_delete_tasks.add(task)
 
+    async def _upload_directory_marker(
+        self,
+        directory_id: str,
+        parent_inode: int,
+        name: bytes,
+    ):
+        marker_path = self._new_spool_path()
+        try:
+            with open(marker_path, "wb") as marker:
+                marker.write(b"\0")
+            parent_id = self._directory_id_for_parent(parent_inode)
+            caption = build_directory_caption(directory_id, parent_id, name)
+
+            async def send_marker_once():
+                return await send_document_from_path(
+                    self._tg_client,
+                    self._chat_id,
+                    marker_path,
+                    DIRECTORY_MARKER_NAME,
+                    1,
+                    caption=caption,
+                )
+
+            msg = await self._retry_flood_wait(
+                f"upload directory marker id={directory_id}",
+                send_marker_once,
+            )
+            remote_entry = self._remote_entry_from_message(msg)
+            metadata = remote_entry[4] if remote_entry else None
+            if (
+                not msg
+                or not remote_entry
+                or not metadata
+                or metadata.get("kind") != "directory"
+                or metadata.get("directory_id") != directory_id
+            ):
+                raise FUSEError(errno.EIO)
+            return msg, remote_entry[0]
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(marker_path)
+
     async def _commit_inode(self, inode: int):
         if inode not in self._files:
             return
@@ -641,6 +860,8 @@ class TelegramFS(pyfuse3.Operations):
                 return
 
             info = self._files[inode]
+            if info.get("kind") != "file":
+                return
             if not info.get("dirty"):
                 return
             if self.read_only or info.get("read_only", False):
@@ -653,6 +874,7 @@ class TelegramFS(pyfuse3.Operations):
             pending_delete = set(info.get("pending_delete_message_ids") or set())
             change_id = info.get("change_id", 0)
             file_name = self._file_name_text(info)
+            parent_id = self._directory_id_for_parent(info["parent_inode"])
             source_file_id = info.get("file_id") if not path else None
 
             if size == 0:
@@ -714,6 +936,7 @@ class TelegramFS(pyfuse3.Operations):
                         snapshot_path,
                         file_name,
                         size,
+                        caption=build_file_caption(parent_id),
                     )
 
                 msg = await self._retry_flood_wait(
@@ -813,7 +1036,8 @@ class TelegramFS(pyfuse3.Operations):
 
     def _should_commit_dirty_info(self, info: dict) -> bool:
         return bool(
-            info.get("dirty")
+            info.get("kind") == "file"
+            and info.get("dirty")
             and not info.get("unlinked")
             and not self.read_only
             and not info.get("read_only", False)
@@ -873,14 +1097,17 @@ class TelegramFS(pyfuse3.Operations):
         if not info or info.get("unlinked"):
             raise FUSEError(errno.ENOENT)
 
-        mode = info.get("mode", 0o644)
+        is_directory = info.get("kind") == "directory"
+        mode = info.get("mode", 0o755 if is_directory else 0o644)
         is_ro = self.read_only or info.get("read_only", False)
         attr = EntryAttributes()
         attr.st_ino = inode
-        attr.st_mode = stat.S_IFREG | (0o444 if is_ro else mode)
+        file_type = stat.S_IFDIR if is_directory else stat.S_IFREG
+        read_only_mode = 0o555 if is_directory else 0o444
+        attr.st_mode = file_type | (read_only_mode if is_ro else mode)
         attr.st_uid = os.getuid()
         attr.st_gid = os.getgid()
-        attr.st_nlink = 1
+        attr.st_nlink = 2 if is_directory else 1
         attr.st_size = info["size"]
         t_ns = info["timestamp"] * 10**9
         attr.st_atime_ns = t_ns
@@ -892,22 +1119,33 @@ class TelegramFS(pyfuse3.Operations):
 
     async def lookup(self, parent_inode, name, ctx=None) -> EntryAttributes:
         if parent_inode != self._root_inode:
-            raise FUSEError(errno.ENOENT)
-        inode = self._name_to_inode.get(name)
+            parent = self._files.get(parent_inode)
+            if not parent or parent.get("kind") != "directory":
+                raise FUSEError(errno.ENOTDIR)
+        inode = self._name_to_inode.get((parent_inode, name))
         if not inode:
             raise FUSEError(errno.ENOENT)
         return await self.getattr(inode)
 
     async def opendir(self, inode, ctx):
-        if inode != self._root_inode:
+        if inode != self._root_inode and (
+            inode not in self._files or self._files[inode].get("kind") != "directory"
+        ):
             raise FUSEError(errno.ENOTDIR)
         return inode
 
     async def readdir(self, fh, start_id, token):
-        if fh != self._root_inode:
+        if fh != self._root_inode and (
+            fh not in self._files or self._files[fh].get("kind") != "directory"
+        ):
             raise FUSEError(errno.ENOTDIR)
 
-        for fname, inode in sorted(self._name_to_inode.items(), key=lambda x: x[1]):
+        entries = (
+            (name, inode)
+            for (parent_inode, name), inode in self._name_to_inode.items()
+            if parent_inode == fh
+        )
+        for fname, inode in sorted(entries, key=lambda item: item[1]):
             if inode < start_id:
                 continue
             attr = await self.getattr(inode)
@@ -916,8 +1154,11 @@ class TelegramFS(pyfuse3.Operations):
             if not ok:
                 break
 
-    def _create_local_inode(self, name: bytes, mode: int, refcount: int) -> int:
-        if name in self._name_to_inode:
+    def _create_local_inode(
+        self, parent_inode: int, name: bytes, mode: int, refcount: int
+    ) -> int:
+        self._directory_id_for_parent(parent_inode)
+        if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
 
         inode = self._next_inode
@@ -926,11 +1167,12 @@ class TelegramFS(pyfuse3.Operations):
             message_id=None,
             file_id=None,
             file_name=name,
+            parent_inode=parent_inode,
             size=0,
             refcount=refcount,
         )
         self._files[inode]["mode"] = mode & 0o777
-        self._name_to_inode[name] = inode
+        self._name_to_inode[(parent_inode, name)] = inode
         return inode
 
     def _file_info(self, fh: int) -> FileInfo:
@@ -942,10 +1184,7 @@ class TelegramFS(pyfuse3.Operations):
     async def create(self, parent_inode, name, mode, flags, ctx):
         if self.read_only:
             raise FUSEError(errno.EROFS)
-        if parent_inode != self._root_inode:
-            raise FUSEError(errno.EPERM)
-
-        inode = self._create_local_inode(name, mode, refcount=1)
+        inode = self._create_local_inode(parent_inode, name, mode, refcount=1)
         fh = self._next_fh
         self._next_fh += 1
         self._fh_to_inode[fh] = inode
@@ -957,12 +1196,10 @@ class TelegramFS(pyfuse3.Operations):
     async def mknod(self, parent_inode, name, mode, rdev, ctx):
         if self.read_only:
             raise FUSEError(errno.EROFS)
-        if parent_inode != self._root_inode:
-            raise FUSEError(errno.EPERM)
         if not stat.S_ISREG(mode):
             raise FUSEError(errno.EPERM)
 
-        inode = self._create_local_inode(name, mode, refcount=0)
+        inode = self._create_local_inode(parent_inode, name, mode, refcount=0)
         return await self.getattr(inode)
 
     async def open(self, inode: int, flags: int, ctx) -> FileInfo:
@@ -970,6 +1207,8 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.ENOENT)
 
         info = self._files[inode]
+        if info.get("kind") == "directory":
+            raise FUSEError(errno.EISDIR)
         accmode = flags & os.O_ACCMODE
         want_write = accmode in (os.O_WRONLY, os.O_RDWR)
 
@@ -1057,14 +1296,15 @@ class TelegramFS(pyfuse3.Operations):
     async def unlink(self, parent_inode: int, name: bytes, ctx):
         if self.read_only:
             raise FUSEError(errno.EROFS)
-        if parent_inode != self._root_inode:
-            raise FUSEError(errno.ENOTDIR)
+        self._directory_id_for_parent(parent_inode)
 
-        inode = self._name_to_inode.get(name)
+        inode = self._name_to_inode.get((parent_inode, name))
         if inode is None:
             raise FUSEError(errno.ENOENT)
 
         info = self._files[inode]
+        if info.get("kind") == "directory":
+            raise FUSEError(errno.EISDIR)
         if info.get("read_only", False):
             raise FUSEError(errno.EPERM)
 
@@ -1087,7 +1327,7 @@ class TelegramFS(pyfuse3.Operations):
             self._pending_remote_delete_msg_ids.discard(msg_id)
 
         self._remove_spool(info)
-        self._name_to_inode.pop(name, None)
+        self._name_to_inode.pop((parent_inode, name), None)
         info["unlinked"] = True
         info["pending_delete_message_ids"] = set()
         if info.get("refcount", 0) == 0:
@@ -1096,26 +1336,48 @@ class TelegramFS(pyfuse3.Operations):
     async def rename(self, parent_inode_old, name_old, parent_inode_new, name_new, flags, ctx):
         if self.read_only:
             raise FUSEError(errno.EROFS)
-        if parent_inode_old != self._root_inode or parent_inode_new != self._root_inode:
-            raise FUSEError(errno.EPERM)
+        self._directory_id_for_parent(parent_inode_old)
+        self._directory_id_for_parent(parent_inode_new)
 
-        old_inode = self._name_to_inode.get(name_old)
+        old_key = (parent_inode_old, name_old)
+        new_key = (parent_inode_new, name_new)
+        old_inode = self._name_to_inode.get(old_key)
         if old_inode is None:
             raise FUSEError(errno.ENOENT)
+        if old_key == new_key:
+            return
 
-        new_inode = self._name_to_inode.get(name_new)
+        new_inode = self._name_to_inode.get(new_key)
         if flags & pyfuse3.RENAME_NOREPLACE and new_inode is not None:
             raise FUSEError(errno.EEXIST)
+
+        old_info = self._files[old_inode]
+        if old_info.get("kind") == "directory":
+            if flags & pyfuse3.RENAME_EXCHANGE:
+                raise FUSEError(errno.EINVAL)
+            await self._rename_directory(
+                old_inode,
+                parent_inode_old,
+                name_old,
+                parent_inode_new,
+                name_new,
+                new_inode,
+            )
+            return
+
+        if new_inode is not None and self._files[new_inode].get("kind") == "directory":
+            raise FUSEError(errno.EISDIR)
 
         if flags & pyfuse3.RENAME_EXCHANGE:
             if new_inode is None:
                 raise FUSEError(errno.ENOENT)
-            old_info = self._files[old_inode]
             new_info = self._files[new_inode]
-            self._name_to_inode[name_old] = new_inode
-            self._name_to_inode[name_new] = old_inode
+            self._name_to_inode[old_key] = new_inode
+            self._name_to_inode[new_key] = old_inode
             old_info["file_name"] = name_new
+            old_info["parent_inode"] = parent_inode_new
             new_info["file_name"] = name_old
+            new_info["parent_inode"] = parent_inode_old
             self._remember_pending_delete(old_info, old_info.get("message_id"))
             self._remember_pending_delete(new_info, new_info.get("message_id"))
             self._mark_dirty(old_info)
@@ -1126,23 +1388,22 @@ class TelegramFS(pyfuse3.Operations):
                 await self._commit_inode_sync(new_inode)
             return
 
-        old_info = self._files[old_inode]
-
         if new_inode is not None and new_inode != old_inode:
             new_info = self._files[new_inode]
             self._cancel_delayed_upload(new_inode)
             self._remember_pending_delete(old_info, new_info.get("message_id"))
             for msg_id in new_info.get("pending_delete_message_ids") or set():
                 self._remember_pending_delete(old_info, msg_id)
-            self._name_to_inode.pop(name_new, None)
+            self._name_to_inode.pop(new_key, None)
             new_info["unlinked"] = True
             self._remove_spool(new_info)
             if new_info.get("refcount", 0) == 0:
                 self._files.pop(new_inode, None)
 
-        self._name_to_inode.pop(name_old, None)
-        self._name_to_inode[name_new] = old_inode
+        self._name_to_inode.pop(old_key, None)
+        self._name_to_inode[new_key] = old_inode
         old_info["file_name"] = name_new
+        old_info["parent_inode"] = parent_inode_new
 
         if old_info.get("file_id") and not old_info.get("dirty"):
             self._remember_pending_delete(old_info, old_info.get("message_id"))
@@ -1158,6 +1419,81 @@ class TelegramFS(pyfuse3.Operations):
             if self._should_commit_dirty_info(old_info):
                 await self._commit_inode_sync(old_inode)
 
+    def _is_directory_descendant(self, parent_inode: int, directory_inode: int) -> bool:
+        current = parent_inode
+        while current != self._root_inode:
+            if current == directory_inode:
+                return True
+            info = self._files.get(current)
+            if not info or info.get("kind") != "directory":
+                return False
+            current = info["parent_inode"]
+        return False
+
+    async def _rename_directory(
+        self,
+        inode: int,
+        old_parent: int,
+        old_name: bytes,
+        new_parent: int,
+        new_name: bytes,
+        target_inode: int | None,
+    ):
+        info = self._files[inode]
+        if info.get("read_only", False):
+            raise FUSEError(errno.EPERM)
+        if self._is_directory_descendant(new_parent, inode):
+            raise FUSEError(errno.EINVAL)
+
+        target_info = None
+        if target_inode is not None and target_inode != inode:
+            target_info = self._files[target_inode]
+            if target_info.get("kind") != "directory":
+                raise FUSEError(errno.ENOTDIR)
+            if self._directory_not_empty(target_inode):
+                raise FUSEError(errno.ENOTEMPTY)
+
+        msg, file_id = await self._upload_directory_marker(
+            info["directory_id"], new_parent, new_name
+        )
+        delete_ids = set(info.get("pending_delete_message_ids") or set())
+        if info.get("message_id"):
+            delete_ids.add(info["message_id"])
+        if target_info:
+            if target_info.get("message_id"):
+                delete_ids.add(target_info["message_id"])
+            delete_ids.update(target_info.get("pending_delete_message_ids") or set())
+
+        self._name_to_inode.pop((old_parent, old_name), None)
+        if target_info:
+            self._name_to_inode.pop((new_parent, new_name), None)
+            self._directory_id_to_inode.pop(target_info["directory_id"], None)
+            old_target_msg = target_info.get("message_id")
+            if old_target_msg:
+                self._msg_id_to_inode.pop(old_target_msg, None)
+            self._files.pop(target_inode, None)
+
+        old_msg_id = info.get("message_id")
+        if old_msg_id:
+            self._msg_id_to_inode.pop(old_msg_id, None)
+        info.update(
+            message_id=msg.id,
+            file_id=file_id,
+            file_name=new_name,
+            parent_inode=new_parent,
+            timestamp=int(time.time()),
+            pending_delete_message_ids=set(),
+        )
+        self._name_to_inode[(new_parent, new_name)] = inode
+        self._msg_id_to_inode[msg.id] = inode
+
+        try:
+            for msg_id in sorted(delete_ids - {msg.id}):
+                await self._delete_remote_message(msg_id)
+        except Exception as exc:
+            info["read_only"] = True
+            raise FUSEError(errno.EIO) from exc
+
     async def setattr(self, inode, attr, fields, fh, ctx):
         if inode == self._root_inode:
             return await self.getattr(inode)
@@ -1170,6 +1506,8 @@ class TelegramFS(pyfuse3.Operations):
                 raise FUSEError(errno.EROFS)
 
         if fields.update_size:
+            if info.get("kind") == "directory":
+                raise FUSEError(errno.EISDIR)
             await self._truncate_inode(inode, attr.st_size)
         if fields.update_mode:
             info["mode"] = attr.st_mode & 0o777
@@ -1182,11 +1520,59 @@ class TelegramFS(pyfuse3.Operations):
 
         return await self.getattr(inode)
 
-    async def mkdir(self, *args, **kwargs):
-        raise FUSEError(errno.ENOTDIR)
+    async def mkdir(self, parent_inode, name, mode, ctx):
+        if self.read_only:
+            raise FUSEError(errno.EROFS)
+        self._directory_id_for_parent(parent_inode)
+        if (parent_inode, name) in self._name_to_inode:
+            raise FUSEError(errno.EEXIST)
 
-    async def rmdir(self, *args, **kwargs):
-        raise FUSEError(errno.ENOTDIR)
+        directory_id = uuid.uuid4().hex
+        msg, file_id = await self._upload_directory_marker(directory_id, parent_inode, name)
+        inode = self._next_inode
+        self._next_inode += 1
+        self._files[inode] = self._new_directory_info(
+            message_id=msg.id,
+            file_id=file_id,
+            file_name=name,
+            parent_inode=parent_inode,
+            directory_id=directory_id,
+        )
+        self._files[inode]["mode"] = mode & 0o777
+        self._name_to_inode[(parent_inode, name)] = inode
+        self._directory_id_to_inode[directory_id] = inode
+        self._msg_id_to_inode[msg.id] = inode
+        return await self.getattr(inode)
+
+    async def rmdir(self, parent_inode, name, ctx):
+        if self.read_only:
+            raise FUSEError(errno.EROFS)
+        self._directory_id_for_parent(parent_inode)
+        inode = self._name_to_inode.get((parent_inode, name))
+        if inode is None:
+            raise FUSEError(errno.ENOENT)
+        info = self._files[inode]
+        if info.get("kind") != "directory":
+            raise FUSEError(errno.ENOTDIR)
+        if self._directory_not_empty(inode):
+            raise FUSEError(errno.ENOTEMPTY)
+        if info.get("read_only", False):
+            raise FUSEError(errno.EPERM)
+
+        ids = set(info.get("pending_delete_message_ids") or set())
+        if info.get("message_id"):
+            ids.add(info["message_id"])
+        try:
+            for msg_id in sorted(ids):
+                await self._delete_remote_message_remote_only(msg_id)
+        except Exception as exc:
+            raise FUSEError(errno.EIO) from exc
+        for msg_id in sorted(ids):
+            self._suppress_remote_message_id(msg_id)
+            self._pending_remote_delete_msg_ids.discard(msg_id)
+        self._name_to_inode.pop((parent_inode, name), None)
+        self._directory_id_to_inode.pop(info["directory_id"], None)
+        self._files.pop(inode, None)
 
     async def link(self, *args, **kwargs):
         raise FUSEError(errno.ENOSYS)
