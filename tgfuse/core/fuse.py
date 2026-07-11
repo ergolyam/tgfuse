@@ -35,6 +35,8 @@ pyfuse3.asyncio.enable()
 
 log = logging_config.setup_logging(__name__)
 
+BOT_DELETE_MAX_AGE = 48 * 60 * 60
+
 
 class TelegramFS(pyfuse3.Operations):
     _REMOTE_CHUNK_SIZE = 1024 * 1024
@@ -43,11 +45,18 @@ class TelegramFS(pyfuse3.Operations):
     _REMOTE_READ_TIMEOUT = 30
     _REMOTE_READ_RETRIES = 3
 
-    def __init__(self, client, chat_id: int, read_only: bool):
+    def __init__(
+        self,
+        client,
+        chat_id: int,
+        read_only: bool,
+        bot_mode: bool = False,
+    ):
         super().__init__()
         self._tg_client = client
         self._chat_id = chat_id
         self.read_only = read_only
+        self.bot_mode = bot_mode
 
         self.enable_writeback_cache = False
         self.supports_dot_lookup = False
@@ -139,7 +148,7 @@ class TelegramFS(pyfuse3.Operations):
                 and inode not in pending_upload_inodes
                 and info.get("dirty")
                 and not self.read_only
-                and not info.get("read_only", False)
+                and not self._entry_is_read_only(info)
             ):
                 with contextlib.suppress(Exception):
                     await self._commit_inode(inode)
@@ -159,7 +168,15 @@ class TelegramFS(pyfuse3.Operations):
         )]
         self._add_remote_docs(docs)
 
-        log.info("Initial sync done, loaded %s entries.", len(self._files))
+        bot_expired = sum(
+            info.get("read_only_reason") == "bot-delete-window"
+            for info in self._files.values()
+        )
+        log.info(
+            "Initial sync done, loaded %s entries (%s bot-expired read-only).",
+            len(self._files),
+            bot_expired,
+        )
 
     def _normalize_remote_doc(self, doc) -> tuple:
         if len(doc) == 5:
@@ -228,6 +245,49 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.ENOTDIR)
         return info["directory_id"]
 
+    def _ensure_writable_directory(self, inode: int):
+        if self.read_only:
+            raise FUSEError(errno.EROFS)
+        if inode == self._root_inode:
+            return
+        info = self._files.get(inode)
+        if not info or info.get("kind") != "directory":
+            raise FUSEError(errno.ENOTDIR)
+        if self._entry_is_read_only(info):
+            raise FUSEError(errno.EROFS)
+
+    def _bot_delete_window_expired(
+        self,
+        message_id: int | None,
+        remote_timestamp: int | None,
+    ) -> bool:
+        return bool(
+            self.bot_mode
+            and message_id
+            and remote_timestamp is not None
+            and int(time.time()) - remote_timestamp >= BOT_DELETE_MAX_AGE
+        )
+
+    def _entry_is_read_only(self, info: dict) -> bool:
+        if info.get("read_only", False):
+            return True
+        if self._bot_delete_window_expired(
+            info.get("message_id"), info.get("remote_timestamp")
+        ):
+            info["read_only"] = True
+            info["read_only_reason"] = "bot-delete-window"
+            log.info(
+                "Entry became read-only after Telegram bot delete window: %s",
+                info.get("file_name"),
+            )
+            return True
+        return False
+
+    def _mark_delete_forbidden(self, info: dict | None):
+        if info is not None:
+            info["read_only"] = True
+            info["read_only_reason"] = "remote-delete-forbidden"
+
     def _add_remote_doc(self, doc):
         m_id, f_id, fname_b, size, ts, metadata = doc
         if metadata and metadata.get("kind") == "directory":
@@ -251,6 +311,13 @@ class TelegramFS(pyfuse3.Operations):
                     file_name=name,
                     parent_inode=parent_inode,
                     timestamp=ts,
+                    remote_timestamp=ts,
+                    read_only=self._bot_delete_window_expired(m_id, ts),
+                    read_only_reason=(
+                        "bot-delete-window"
+                        if self._bot_delete_window_expired(m_id, ts)
+                        else None
+                    ),
                 )
                 self._name_to_inode[(parent_inode, name)] = existing_inode
                 self._msg_id_to_inode[m_id] = existing_inode
@@ -404,6 +471,7 @@ class TelegramFS(pyfuse3.Operations):
         timestamp: int | None = None,
         refcount: int = 0,
     ) -> dict:
+        timestamp = int(time.time()) if timestamp is None else timestamp
         return {
             "message_id": message_id,
             "kind": "file",
@@ -411,12 +479,19 @@ class TelegramFS(pyfuse3.Operations):
             "file_name": file_name,
             "parent_inode": parent_inode,
             "size": size,
-            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "timestamp": timestamp,
+            "remote_size": size if message_id else 0,
+            "remote_timestamp": timestamp if message_id else None,
             "data": bytearray(),
             "dirty": False,
             "change_id": 0,
             "refcount": refcount,
-            "read_only": False,
+            "read_only": self._bot_delete_window_expired(message_id, timestamp),
+            "read_only_reason": (
+                "bot-delete-window"
+                if self._bot_delete_window_expired(message_id, timestamp)
+                else None
+            ),
             "spool_path": None,
             "pending_delete_message_ids": set(),
             "unlinked": False,
@@ -433,6 +508,7 @@ class TelegramFS(pyfuse3.Operations):
         directory_id: str,
         timestamp: int | None = None,
     ) -> dict:
+        timestamp = int(time.time()) if timestamp is None else timestamp
         return {
             "message_id": message_id,
             "kind": "directory",
@@ -441,10 +517,16 @@ class TelegramFS(pyfuse3.Operations):
             "parent_inode": parent_inode,
             "directory_id": directory_id,
             "size": 0,
-            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "timestamp": timestamp,
+            "remote_timestamp": timestamp if message_id else None,
             "dirty": False,
             "refcount": 0,
-            "read_only": False,
+            "read_only": self._bot_delete_window_expired(message_id, timestamp),
+            "read_only_reason": (
+                "bot-delete-window"
+                if self._bot_delete_window_expired(message_id, timestamp)
+                else None
+            ),
             "pending_delete_message_ids": set(),
             "unlinked": False,
             "mode": 0o755,
@@ -460,6 +542,7 @@ class TelegramFS(pyfuse3.Operations):
         target: bytes,
         timestamp: int | None = None,
     ) -> dict:
+        timestamp = int(time.time()) if timestamp is None else timestamp
         return {
             "message_id": message_id,
             "kind": "symlink",
@@ -468,10 +551,16 @@ class TelegramFS(pyfuse3.Operations):
             "parent_inode": parent_inode,
             "target": target,
             "size": len(target),
-            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "timestamp": timestamp,
+            "remote_timestamp": timestamp if message_id else None,
             "dirty": False,
             "refcount": 0,
-            "read_only": False,
+            "read_only": self._bot_delete_window_expired(message_id, timestamp),
+            "read_only_reason": (
+                "bot-delete-window"
+                if self._bot_delete_window_expired(message_id, timestamp)
+                else None
+            ),
             "pending_delete_message_ids": set(),
             "unlinked": False,
             "mode": 0o777,
@@ -573,7 +662,7 @@ class TelegramFS(pyfuse3.Operations):
     async def _truncate_inode(self, inode: int, size: int):
         async with self._lock_for(inode):
             info = self._files[inode]
-            if self.read_only or info.get("read_only", False):
+            if self.read_only or self._entry_is_read_only(info):
                 raise FUSEError(errno.EROFS)
 
             copy_remote = bool(size and info.get("file_id") and not info.get("dirty"))
@@ -827,6 +916,44 @@ class TelegramFS(pyfuse3.Operations):
             raise
         self._pending_remote_delete_msg_ids.discard(msg_id)
 
+    async def _delete_remote_message_ids_atomic(self, msg_ids) -> None:
+        msg_ids = tuple(sorted({msg_id for msg_id in msg_ids if msg_id}))
+        if not msg_ids:
+            return
+        inode_by_msg_id = {
+            msg_id: self._msg_id_to_inode.get(msg_id) for msg_id in msg_ids
+        }
+        for msg_id in msg_ids:
+            self._suppress_remote_message_id(msg_id)
+        try:
+            await self._retry_flood_wait(
+                f"delete msg_ids={msg_ids}",
+                lambda: self._tg_client.delete_messages(
+                    self._chat_id, list(msg_ids)
+                ),
+            )
+        except Exception:
+            for msg_id in msg_ids:
+                self._unsuppress_remote_message_id(msg_id)
+                inode = inode_by_msg_id.get(msg_id)
+                if inode is not None:
+                    self._msg_id_to_inode[msg_id] = inode
+            raise
+        for msg_id in msg_ids:
+            self._pending_remote_delete_msg_ids.discard(msg_id)
+
+    async def _rollback_uploaded_message(self, msg_id: int, label: str):
+        try:
+            await self._delete_remote_message_ids_atomic((msg_id,))
+        except Exception as exc:
+            self._suppressed_msg_ids.add(msg_id)
+            log.error(
+                "Rollback could not delete new msg_id=%s after %s: %s",
+                msg_id,
+                label,
+                exc,
+            )
+
     async def _delete_remote_messages(self, msg_ids: tuple[int, ...]):
         try:
             for msg_id in msg_ids:
@@ -937,6 +1064,42 @@ class TelegramFS(pyfuse3.Operations):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(marker_path)
 
+    async def _rollback_file_commit(self, inode: int, delete_ids: set[int]):
+        async with self._lock_for(inode):
+            info = self._files.get(inode)
+            if not info:
+                return
+            rollback = info.pop("rename_rollback", None)
+            if rollback:
+                current_key = (info["parent_inode"], info["file_name"])
+                if self._name_to_inode.get(current_key) == inode:
+                    self._name_to_inode.pop(current_key, None)
+                source_state = rollback["source_state"]
+                info.update(source_state)
+                self._name_to_inode[rollback["old_key"]] = inode
+
+                target_inode = rollback.get("target_inode")
+                target_info = rollback.get("target_info")
+                if target_inode is not None and target_info is not None:
+                    target_info["unlinked"] = False
+                    self._files[target_inode] = target_info
+                    self._name_to_inode[rollback["new_key"]] = target_inode
+                    if target_info.get("message_id") in delete_ids:
+                        self._mark_delete_forbidden(target_info)
+
+                if info.get("message_id") in delete_ids:
+                    self._mark_delete_forbidden(info)
+                return
+
+            self._remove_spool(info)
+            info["size"] = info.get("remote_size", info.get("size", 0))
+            if info.get("remote_timestamp") is not None:
+                info["timestamp"] = info["remote_timestamp"]
+            info["dirty"] = False
+            info["pending_delete_message_ids"] = set()
+            if info.get("message_id") in delete_ids:
+                self._mark_delete_forbidden(info)
+
     async def _commit_inode(self, inode: int):
         task = asyncio.create_task(self._commit_inode_impl(inode))
         self._active_upload_tasks.setdefault(inode, set()).add(task)
@@ -962,8 +1125,12 @@ class TelegramFS(pyfuse3.Operations):
         if inode not in self._files:
             return
 
+        current_info = self._files[inode]
+        if current_info.get("dirty") and self._entry_is_read_only(current_info):
+            await self._rollback_file_commit(inode, set())
+            raise FUSEError(errno.EROFS)
+
         snapshot_path = None
-        delete_after_upload: set[int] = set()
         should_continue = False
 
         async with self._lock_for(inode):
@@ -975,7 +1142,7 @@ class TelegramFS(pyfuse3.Operations):
                 return
             if not info.get("dirty"):
                 return
-            if self.read_only or info.get("read_only", False):
+            if self.read_only or self._entry_is_read_only(info):
                 return
 
             path = info.get("spool_path")
@@ -987,44 +1154,45 @@ class TelegramFS(pyfuse3.Operations):
             file_name = self._file_name_text(info)
             parent_id = self._directory_id_for_parent(info["parent_inode"])
             source_file_id = info.get("file_id") if not path else None
+            original_message_id = info.get("message_id")
+            delete_after_upload = set(pending_delete)
+            if original_message_id:
+                delete_after_upload.add(original_message_id)
 
-            if size == 0:
-                delete_after_upload = pending_delete
-            elif path:
+            if size > 0 and path:
                 snapshot_path = self._new_spool_path()
                 shutil.copyfile(path, snapshot_path)
-            elif source_file_id:
+            elif size > 0 and source_file_id:
                 snapshot_path = self._new_spool_path()
-            else:
+            elif size > 0:
                 raise FUSEError(errno.EIO)
 
-        delete_failed = False
-
         if size == 0:
-            for old_id in sorted(delete_after_upload):
-                try:
-                    await self._delete_remote_message(old_id)
-                except RPCError as exc:
-                    log.warning("Can't delete msg_id=%s: %s", old_id, exc)
-                    delete_failed = True
+            try:
+                await self._delete_remote_message_ids_atomic(delete_after_upload)
+            except Exception as exc:
+                log.warning(
+                    "Can't commit zero-size inode=%s because delete failed: %s",
+                    inode,
+                    exc,
+                )
+                await self._rollback_file_commit(inode, delete_after_upload)
+                raise FUSEError(errno.EIO) from exc
 
             async with self._lock_for(inode):
                 info = self._files.get(inode)
                 if not info:
                     return
-                if delete_failed:
-                    info["read_only"] = True
-                    return
                 if info.get("change_id", 0) == change_id:
                     self._remove_spool(info)
-                    old_msg_id = info.get("message_id")
-                    if old_msg_id:
-                        self._msg_id_to_inode.pop(old_msg_id, None)
                     info["message_id"] = None
                     info["file_id"] = None
                     info["dirty"] = False
                     info["pending_delete_message_ids"] = set()
                     info["timestamp"] = int(time.time())
+                    info["remote_timestamp"] = None
+                    info["remote_size"] = 0
+                    info.pop("rename_rollback", None)
                 else:
                     should_continue = bool(info.get("dirty") and not info.get("unlinked"))
             if should_continue:
@@ -1056,10 +1224,11 @@ class TelegramFS(pyfuse3.Operations):
                 )
             except RPCError as exc:
                 log.error("Upload failed inode=%s: %s", inode, exc)
+                await self._rollback_file_commit(inode, set())
                 async with self._lock_for(inode):
                     info = self._files.get(inode)
                     if info:
-                        info["read_only"] = True
+                        self._mark_delete_forbidden(info)
                 raise FUSEError(errno.EIO) from exc
 
             remote_file = self._remote_doc_from_message(msg)
@@ -1072,49 +1241,57 @@ class TelegramFS(pyfuse3.Operations):
             async with self._lock_for(inode):
                 info = self._files.get(inode)
                 if not info or info.get("unlinked"):
-                    delete_after_upload = {new_msg_id}
+                    await self._rollback_uploaded_message(
+                        new_msg_id, f"unlinked inode={inode}"
+                    )
+                    return
+
+            try:
+                await self._delete_remote_message_ids_atomic(delete_after_upload)
+            except Exception as exc:
+                log.warning(
+                    "Can't replace inode=%s because old delete failed: %s",
+                    inode,
+                    exc,
+                )
+                await self._rollback_uploaded_message(
+                    new_msg_id, f"failed replace inode={inode}"
+                )
+                await self._rollback_file_commit(inode, delete_after_upload)
+                raise FUSEError(errno.EIO) from exc
+
+            async with self._lock_for(inode):
+                info = self._files.get(inode)
+                if not info or info.get("unlinked"):
+                    await self._rollback_uploaded_message(
+                        new_msg_id, f"late unlink inode={inode}"
+                    )
+                    return
+
+                now = int(time.time())
+                info["message_id"] = new_msg_id
+                info["file_id"] = new_file_id
+                info["remote_size"] = size
+                info["remote_timestamp"] = now
+                info["read_only"] = False
+                info["read_only_reason"] = None
+                self._msg_id_to_inode[new_msg_id] = inode
+
+                if info.get("change_id", 0) == change_id:
+                    info["size"] = size
+                    info["timestamp"] = now
+                    info["dirty"] = False
+                    info["pending_delete_message_ids"] = set()
+                    info.pop("rename_rollback", None)
+                    self._remove_spool(info)
                     should_continue = False
                 else:
-                    old_msg_id = info.get("message_id")
-                    if old_msg_id and old_msg_id != new_msg_id:
-                        pending_delete.add(old_msg_id)
-                        self._msg_id_to_inode.pop(old_msg_id, None)
-
-                    info["message_id"] = new_msg_id
-                    info["file_id"] = new_file_id
-                    self._msg_id_to_inode[new_msg_id] = inode
-
-                    if info.get("change_id", 0) == change_id:
-                        info["size"] = size
-                        info["timestamp"] = int(time.time())
-                        info["dirty"] = False
-                        info["pending_delete_message_ids"] = set()
-                        self._remove_spool(info)
-                        should_continue = False
-                    else:
-                        info.setdefault("pending_delete_message_ids", set()).add(new_msg_id)
-                        should_continue = bool(
-                            info.get("dirty")
-                            and not info.get("unlinked")
-                            and info.get("refcount", 0) == 0
-                        )
-
-                    delete_after_upload = {
-                        msg_id for msg_id in pending_delete if msg_id != new_msg_id
-                    }
-
-            for old_id in sorted(delete_after_upload):
-                try:
-                    await self._delete_remote_message(old_id)
-                except RPCError as exc:
-                    log.warning("Can't delete old msg_id=%s after upload: %s", old_id, exc)
-                    delete_failed = True
-
-            if delete_failed:
-                async with self._lock_for(inode):
-                    info = self._files.get(inode)
-                    if info:
-                        info["read_only"] = True
+                    info.setdefault("pending_delete_message_ids", set()).add(new_msg_id)
+                    should_continue = bool(
+                        info.get("dirty")
+                        and not info.get("unlinked")
+                        and info.get("refcount", 0) == 0
+                    )
 
             if should_continue:
                 self._schedule_upload(inode, 0)
@@ -1165,7 +1342,7 @@ class TelegramFS(pyfuse3.Operations):
             and info.get("dirty")
             and not info.get("unlinked")
             and not self.read_only
-            and not info.get("read_only", False)
+            and not self._entry_is_read_only(info)
             and (
                 info.get("pending_delete_message_ids")
                 or not self._is_temp_name(info["file_name"])
@@ -1186,7 +1363,7 @@ class TelegramFS(pyfuse3.Operations):
                     not info
                     or not info.get("dirty")
                     or info.get("unlinked")
-                    or info.get("read_only", False)
+                    or self._entry_is_read_only(info)
                     or self.read_only
                     or info.get("refcount", 0) > 0
                 ):
@@ -1226,7 +1403,7 @@ class TelegramFS(pyfuse3.Operations):
         is_symlink = info.get("kind") == "symlink"
         default_mode = 0o755 if is_directory else (0o777 if is_symlink else 0o644)
         mode = info.get("mode", default_mode)
-        is_ro = self.read_only or info.get("read_only", False)
+        is_ro = self.read_only or self._entry_is_read_only(info)
         attr = EntryAttributes()
         attr.st_ino = inode
         file_type = stat.S_IFDIR if is_directory else (
@@ -1287,6 +1464,7 @@ class TelegramFS(pyfuse3.Operations):
         self, parent_inode: int, name: bytes, mode: int, refcount: int
     ) -> int:
         self._directory_id_for_parent(parent_inode)
+        self._ensure_writable_directory(parent_inode)
         if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
 
@@ -1343,7 +1521,7 @@ class TelegramFS(pyfuse3.Operations):
         accmode = flags & os.O_ACCMODE
         want_write = accmode in (os.O_WRONLY, os.O_RDWR)
 
-        if (self.read_only or info.get("read_only", False)) and want_write:
+        if (self.read_only or self._entry_is_read_only(info)) and want_write:
             raise FUSEError(errno.EROFS)
 
         if want_write and flags & os.O_TRUNC:
@@ -1404,7 +1582,7 @@ class TelegramFS(pyfuse3.Operations):
 
         async with self._lock_for(inode):
             info = self._files[inode]
-            if self.read_only or info.get("read_only", False):
+            if self.read_only or self._entry_is_read_only(info):
                 raise FUSEError(errno.EROFS)
 
             copy_remote = bool(info.get("file_id") and not info.get("dirty"))
@@ -1428,6 +1606,7 @@ class TelegramFS(pyfuse3.Operations):
         if self.read_only:
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
+        self._ensure_writable_directory(parent_inode)
 
         inode = self._name_to_inode.get((parent_inode, name))
         if inode is None:
@@ -1436,7 +1615,7 @@ class TelegramFS(pyfuse3.Operations):
         info = self._files[inode]
         if info.get("kind") == "directory":
             raise FUSEError(errno.EISDIR)
-        if info.get("read_only", False):
+        if self._entry_is_read_only(info):
             raise FUSEError(errno.EPERM)
 
         await self._cancel_delayed_upload_task(inode)
@@ -1449,17 +1628,13 @@ class TelegramFS(pyfuse3.Operations):
         ids.update(info.get("pending_delete_message_ids") or set())
 
         try:
-            for msg_id in sorted(ids):
-                await self._delete_remote_message_remote_only(msg_id)
+            await self._delete_remote_message_ids_atomic(ids)
         except Exception as exc:
             log.warning("Can't unlink %s because remote delete failed: %s", name, exc)
+            self._mark_delete_forbidden(info)
             if info.get("dirty") and info.get("refcount", 0) == 0 and self._should_commit_dirty_info(info):
                 self._schedule_upload(inode, 0)
             raise FUSEError(errno.EIO) from exc
-
-        for msg_id in sorted(ids):
-            self._suppress_remote_message_id(msg_id)
-            self._pending_remote_delete_msg_ids.discard(msg_id)
 
         self._remove_spool(info)
         self._name_to_inode.pop((parent_inode, name), None)
@@ -1473,6 +1648,8 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode_old)
         self._directory_id_for_parent(parent_inode_new)
+        self._ensure_writable_directory(parent_inode_old)
+        self._ensure_writable_directory(parent_inode_new)
 
         old_key = (parent_inode_old, name_old)
         new_key = (parent_inode_new, name_new)
@@ -1487,6 +1664,14 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EEXIST)
 
         old_info = self._files[old_inode]
+        if self._entry_is_read_only(old_info):
+            raise FUSEError(errno.EPERM)
+        if (
+            new_inode is not None
+            and new_inode != old_inode
+            and self._entry_is_read_only(self._files[new_inode])
+        ):
+            raise FUSEError(errno.EPERM)
         if old_info.get("kind") != "directory":
             await self._cancel_delayed_upload_task(old_inode)
             await self._cancel_active_upload_tasks(old_inode)
@@ -1537,6 +1722,34 @@ class TelegramFS(pyfuse3.Operations):
             if new_info.get("refcount", 0) == 0 and self._should_commit_dirty_info(new_info):
                 await self._commit_inode_sync(new_inode)
             return
+
+        rollback_needed = bool(
+            old_info.get("message_id")
+            or old_info.get("dirty")
+            or old_info.get("pending_delete_message_ids")
+            or (
+                new_inode is not None
+                and self._files[new_inode].get("message_id")
+            )
+        )
+        if rollback_needed and not old_info.get("rename_rollback"):
+            old_info["rename_rollback"] = {
+                "old_key": old_key,
+                "new_key": new_key,
+                "source_state": {
+                    "file_name": old_info["file_name"],
+                    "parent_inode": old_info["parent_inode"],
+                    "size": old_info["size"],
+                    "timestamp": old_info["timestamp"],
+                    "dirty": old_info.get("dirty", False),
+                    "change_id": old_info.get("change_id", 0),
+                    "pending_delete_message_ids": set(
+                        old_info.get("pending_delete_message_ids") or set()
+                    ),
+                },
+                "target_inode": new_inode,
+                "target_info": self._files.get(new_inode) if new_inode else None,
+            }
 
         if new_inode is not None and new_inode != old_inode:
             new_info = self._files[new_inode]
@@ -1591,7 +1804,7 @@ class TelegramFS(pyfuse3.Operations):
         target_inode: int | None,
     ):
         info = self._files[inode]
-        if info.get("read_only", False):
+        if self._entry_is_read_only(info):
             raise FUSEError(errno.EPERM)
 
         target_info = None
@@ -1613,6 +1826,16 @@ class TelegramFS(pyfuse3.Operations):
                 delete_ids.add(target_info["message_id"])
             delete_ids.update(target_info.get("pending_delete_message_ids") or set())
 
+        try:
+            await self._delete_remote_message_ids_atomic(delete_ids - {msg.id})
+        except Exception as exc:
+            await self._rollback_uploaded_message(
+                msg.id, f"failed symlink rename inode={inode}"
+            )
+            self._mark_delete_forbidden(info)
+            self._mark_delete_forbidden(target_info)
+            raise FUSEError(errno.EIO) from exc
+
         self._name_to_inode.pop((old_parent, old_name), None)
         if target_info:
             self._name_to_inode.pop((new_parent, new_name), None)
@@ -1633,17 +1856,13 @@ class TelegramFS(pyfuse3.Operations):
             file_name=new_name,
             parent_inode=new_parent,
             timestamp=int(time.time()),
+            remote_timestamp=int(time.time()),
+            read_only=False,
+            read_only_reason=None,
             pending_delete_message_ids=set(),
         )
         self._name_to_inode[(new_parent, new_name)] = inode
         self._msg_id_to_inode[msg.id] = inode
-
-        try:
-            for msg_id in sorted(delete_ids - {msg.id}):
-                await self._delete_remote_message(msg_id)
-        except Exception as exc:
-            info["read_only"] = True
-            raise FUSEError(errno.EIO) from exc
 
     async def _rename_directory(
         self,
@@ -1655,7 +1874,7 @@ class TelegramFS(pyfuse3.Operations):
         target_inode: int | None,
     ):
         info = self._files[inode]
-        if info.get("read_only", False):
+        if self._entry_is_read_only(info):
             raise FUSEError(errno.EPERM)
         if self._is_directory_descendant(new_parent, inode):
             raise FUSEError(errno.EINVAL)
@@ -1679,6 +1898,16 @@ class TelegramFS(pyfuse3.Operations):
                 delete_ids.add(target_info["message_id"])
             delete_ids.update(target_info.get("pending_delete_message_ids") or set())
 
+        try:
+            await self._delete_remote_message_ids_atomic(delete_ids - {msg.id})
+        except Exception as exc:
+            await self._rollback_uploaded_message(
+                msg.id, f"failed directory rename inode={inode}"
+            )
+            self._mark_delete_forbidden(info)
+            self._mark_delete_forbidden(target_info)
+            raise FUSEError(errno.EIO) from exc
+
         self._name_to_inode.pop((old_parent, old_name), None)
         if target_info:
             self._name_to_inode.pop((new_parent, new_name), None)
@@ -1697,17 +1926,13 @@ class TelegramFS(pyfuse3.Operations):
             file_name=new_name,
             parent_inode=new_parent,
             timestamp=int(time.time()),
+            remote_timestamp=int(time.time()),
+            read_only=False,
+            read_only_reason=None,
             pending_delete_message_ids=set(),
         )
         self._name_to_inode[(new_parent, new_name)] = inode
         self._msg_id_to_inode[msg.id] = inode
-
-        try:
-            for msg_id in sorted(delete_ids - {msg.id}):
-                await self._delete_remote_message(msg_id)
-        except Exception as exc:
-            info["read_only"] = True
-            raise FUSEError(errno.EIO) from exc
 
     async def setattr(self, inode, attr, fields, fh, ctx):
         if inode == self._root_inode:
@@ -1716,7 +1941,7 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.ENOENT)
 
         info = self._files[inode]
-        if self.read_only or info.get("read_only", False):
+        if self.read_only or self._entry_is_read_only(info):
             if fields.update_size or fields.update_mode or fields.update_uid or fields.update_gid:
                 raise FUSEError(errno.EROFS)
 
@@ -1739,6 +1964,7 @@ class TelegramFS(pyfuse3.Operations):
         if self.read_only:
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
+        self._ensure_writable_directory(parent_inode)
         if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
 
@@ -1763,6 +1989,7 @@ class TelegramFS(pyfuse3.Operations):
         if self.read_only:
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
+        self._ensure_writable_directory(parent_inode)
         inode = self._name_to_inode.get((parent_inode, name))
         if inode is None:
             raise FUSEError(errno.ENOENT)
@@ -1771,20 +1998,17 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.ENOTDIR)
         if self._directory_not_empty(inode):
             raise FUSEError(errno.ENOTEMPTY)
-        if info.get("read_only", False):
+        if self._entry_is_read_only(info):
             raise FUSEError(errno.EPERM)
 
         ids = set(info.get("pending_delete_message_ids") or set())
         if info.get("message_id"):
             ids.add(info["message_id"])
         try:
-            for msg_id in sorted(ids):
-                await self._delete_remote_message_remote_only(msg_id)
+            await self._delete_remote_message_ids_atomic(ids)
         except Exception as exc:
+            self._mark_delete_forbidden(info)
             raise FUSEError(errno.EIO) from exc
-        for msg_id in sorted(ids):
-            self._suppress_remote_message_id(msg_id)
-            self._pending_remote_delete_msg_ids.discard(msg_id)
         self._name_to_inode.pop((parent_inode, name), None)
         self._directory_id_to_inode.pop(info["directory_id"], None)
         self._files.pop(inode, None)
@@ -1796,6 +2020,7 @@ class TelegramFS(pyfuse3.Operations):
         if self.read_only:
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
+        self._ensure_writable_directory(parent_inode)
         if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
         if not target or len(target) > 384 or b"\0" in target:

@@ -51,7 +51,12 @@ async def init():
         read = not can_write
         log.info("Read-only mode: %s", read)
 
-        fs = TelegramFS(app, chat_id, read_only=read)
+        fs = TelegramFS(
+            app,
+            chat_id,
+            read_only=read,
+            bot_mode=bool(Config.tg_token),
+        )
         await fs.init_fs()
 
         fuse_opts = set(pyfuse3.default_options)
