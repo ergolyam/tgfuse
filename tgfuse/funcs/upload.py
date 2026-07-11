@@ -107,6 +107,8 @@ async def save_big_file_from_path(
     uploaded_lock = asyncio.Lock()
     next_log_at = 64 * 1024 * 1024
     started_at = time.monotonic()
+    producer_task = None
+    worker_tasks = []
 
     log.info(
         "Fast upload started name=%s size=%s workers=%s buffer_parts=%s",
@@ -203,6 +205,12 @@ async def save_big_file_from_path(
         )
     finally:
         cancel_event.set()
+        upload_tasks = [task for task in [producer_task, *worker_tasks] if task]
+        for task in upload_tasks:
+            if not task.done():
+                task.cancel()
+        if upload_tasks:
+            await asyncio.gather(*upload_tasks, return_exceptions=True)
         for session in sessions:
             try:
                 await session.stop()

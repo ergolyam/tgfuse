@@ -51,7 +51,7 @@ python -m venv .venv
 - **Automatic synchronization**: Periodically checks for new/removed files in the Telegram chat and updates the mounted filesystem accordingly.
 - **Persistent directories**: Nested and empty directories are restored from versioned metadata stored in Telegram document captions.
 - **Lazy streamed downloads**: Files are read from Telegram on demand with bounded read-ahead for sequential media playback.
-- **On-demand uploads**: When creating or modifying files, they are uploaded back to the Telegram chat.
+- **On-demand uploads**: When creating or modifying files, they are uploaded back to the Telegram chat. Removing a file cancels its pending or active upload, including queued large-file chunks.
 - **Multiple Client Support**: Enjoy the flexibility to connect to Telegram in two distinct ways.
     - **Userbot Support**: Use your personal Telegram account (userbot) to access all available features when needed.  
     - **Bot Token Support**: Alternatively, utilize a dedicated bot token for accessing Telegram content, offering a robust and controlled method for managing your channels.

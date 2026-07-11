@@ -22,8 +22,10 @@ from tgfuse.funcs.floodwait import sleep_for_flood_wait, retry_flood_wait
 from tgfuse.funcs.media import (
     DIRECTORY_MARKER_NAME,
     ROOT_DIRECTORY_ID,
+    SYMLINK_MARKER_NAME,
     build_directory_caption,
     build_file_caption,
+    build_symlink_caption,
     remote_entry_from_message,
     remote_file_from_message,
 )
@@ -61,6 +63,7 @@ class TelegramFS(pyfuse3.Operations):
         self._files: dict[int, dict] = {}
 
         self._delayed_upload_tasks: dict[int, asyncio.Task] = {}
+        self._active_upload_tasks: dict[int, set[asyncio.Task]] = {}
         self._remote_delete_tasks: set[asyncio.Task] = set()
         self._sync_task = None
 
@@ -100,6 +103,10 @@ class TelegramFS(pyfuse3.Operations):
                 with contextlib.suppress(asyncio.CancelledError):
                     await done_task
             self._delayed_upload_tasks.pop(inode, None)
+
+        for inode in list(self._active_upload_tasks):
+            pending_upload_inodes.add(inode)
+            await self._cancel_active_upload_tasks(inode)
 
         for task in list(self._remote_delete_tasks):
             done, pending = await asyncio.wait({task}, timeout=5)
@@ -262,6 +269,19 @@ class TelegramFS(pyfuse3.Operations):
                 timestamp=ts,
             )
             self._directory_id_to_inode[directory_id] = inode
+        elif metadata and metadata.get("kind") == "symlink":
+            parent_inode = self._parent_inode_for_id(metadata["parent_id"])
+            name = self._unique_file_name(parent_inode, metadata["name"])
+            inode = self._next_inode
+            self._next_inode += 1
+            self._files[inode] = self._new_symlink_info(
+                message_id=m_id,
+                file_id=f_id,
+                file_name=name,
+                parent_inode=parent_inode,
+                target=metadata["target"],
+                timestamp=ts,
+            )
         else:
             parent_id = metadata["parent_id"] if metadata else ROOT_DIRECTORY_ID
             parent_inode = self._parent_inode_for_id(parent_id)
@@ -428,6 +448,33 @@ class TelegramFS(pyfuse3.Operations):
             "pending_delete_message_ids": set(),
             "unlinked": False,
             "mode": 0o755,
+        }
+
+    def _new_symlink_info(
+        self,
+        *,
+        message_id: int | None,
+        file_id: str | None,
+        file_name: bytes,
+        parent_inode: int,
+        target: bytes,
+        timestamp: int | None = None,
+    ) -> dict:
+        return {
+            "message_id": message_id,
+            "kind": "symlink",
+            "file_id": file_id,
+            "file_name": file_name,
+            "parent_inode": parent_inode,
+            "target": target,
+            "size": len(target),
+            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "dirty": False,
+            "refcount": 0,
+            "read_only": False,
+            "pending_delete_message_ids": set(),
+            "unlinked": False,
+            "mode": 0o777,
         }
 
     def _unique_file_name(self, parent_inode: int, fname: bytes) -> bytes:
@@ -847,7 +894,71 @@ class TelegramFS(pyfuse3.Operations):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(marker_path)
 
+    async def _upload_symlink_marker(
+        self,
+        parent_inode: int,
+        name: bytes,
+        target: bytes,
+    ):
+        marker_path = self._new_spool_path()
+        try:
+            with open(marker_path, "wb") as marker:
+                marker.write(b"\0")
+            parent_id = self._directory_id_for_parent(parent_inode)
+            caption = build_symlink_caption(parent_id, name, target)
+
+            async def send_marker_once():
+                return await send_document_from_path(
+                    self._tg_client,
+                    self._chat_id,
+                    marker_path,
+                    SYMLINK_MARKER_NAME,
+                    1,
+                    caption=caption,
+                )
+
+            msg = await self._retry_flood_wait(
+                f"upload symlink marker name={name!r}",
+                send_marker_once,
+            )
+            remote_entry = self._remote_entry_from_message(msg)
+            metadata = remote_entry[4] if remote_entry else None
+            if (
+                not msg
+                or not remote_entry
+                or not metadata
+                or metadata.get("kind") != "symlink"
+                or metadata.get("name") != name
+                or metadata.get("target") != target
+            ):
+                raise FUSEError(errno.EIO)
+            return msg, remote_entry[0]
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(marker_path)
+
     async def _commit_inode(self, inode: int):
+        task = asyncio.create_task(self._commit_inode_impl(inode))
+        self._active_upload_tasks.setdefault(inode, set()).add(task)
+        try:
+            await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise
+            if not task.cancelled():
+                raise
+        finally:
+            tasks = self._active_upload_tasks.get(inode)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    self._active_upload_tasks.pop(inode, None)
+
+    async def _commit_inode_impl(self, inode: int):
         if inode not in self._files:
             return
 
@@ -1034,6 +1145,20 @@ class TelegramFS(pyfuse3.Operations):
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    async def _cancel_active_upload_tasks(self, inode: int):
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in self._active_upload_tasks.get(inode, set())
+            if task is not current and not task.done()
+        }
+        if not tasks:
+            return
+        log.info("Cancelling %s active upload(s) for inode=%s.", len(tasks), inode)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def _should_commit_dirty_info(self, info: dict) -> bool:
         return bool(
             info.get("kind") == "file"
@@ -1098,12 +1223,16 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.ENOENT)
 
         is_directory = info.get("kind") == "directory"
-        mode = info.get("mode", 0o755 if is_directory else 0o644)
+        is_symlink = info.get("kind") == "symlink"
+        default_mode = 0o755 if is_directory else (0o777 if is_symlink else 0o644)
+        mode = info.get("mode", default_mode)
         is_ro = self.read_only or info.get("read_only", False)
         attr = EntryAttributes()
         attr.st_ino = inode
-        file_type = stat.S_IFDIR if is_directory else stat.S_IFREG
-        read_only_mode = 0o555 if is_directory else 0o444
+        file_type = stat.S_IFDIR if is_directory else (
+            stat.S_IFLNK if is_symlink else stat.S_IFREG
+        )
+        read_only_mode = 0o555 if is_directory else (0o777 if is_symlink else 0o444)
         attr.st_mode = file_type | (read_only_mode if is_ro else mode)
         attr.st_uid = os.getuid()
         attr.st_gid = os.getgid()
@@ -1209,6 +1338,8 @@ class TelegramFS(pyfuse3.Operations):
         info = self._files[inode]
         if info.get("kind") == "directory":
             raise FUSEError(errno.EISDIR)
+        if info.get("kind") == "symlink":
+            raise FUSEError(errno.ELOOP)
         accmode = flags & os.O_ACCMODE
         want_write = accmode in (os.O_WRONLY, os.O_RDWR)
 
@@ -1309,6 +1440,10 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EPERM)
 
         await self._cancel_delayed_upload_task(inode)
+        await self._cancel_active_upload_tasks(inode)
+        info = self._files.get(inode)
+        if info is None:
+            return
         ids = set(info.get("pending_delete_message_ids") or set())
         self._remember_pending_delete(info, info.get("message_id"))
         ids.update(info.get("pending_delete_message_ids") or set())
@@ -1352,6 +1487,21 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EEXIST)
 
         old_info = self._files[old_inode]
+        if old_info.get("kind") != "directory":
+            await self._cancel_delayed_upload_task(old_inode)
+            await self._cancel_active_upload_tasks(old_inode)
+        if old_info.get("kind") == "symlink":
+            if flags & pyfuse3.RENAME_EXCHANGE:
+                raise FUSEError(errno.EINVAL)
+            await self._rename_symlink(
+                old_inode,
+                parent_inode_old,
+                name_old,
+                parent_inode_new,
+                name_new,
+                new_inode,
+            )
+            return
         if old_info.get("kind") == "directory":
             if flags & pyfuse3.RENAME_EXCHANGE:
                 raise FUSEError(errno.EINVAL)
@@ -1390,7 +1540,8 @@ class TelegramFS(pyfuse3.Operations):
 
         if new_inode is not None and new_inode != old_inode:
             new_info = self._files[new_inode]
-            self._cancel_delayed_upload(new_inode)
+            await self._cancel_delayed_upload_task(new_inode)
+            await self._cancel_active_upload_tasks(new_inode)
             self._remember_pending_delete(old_info, new_info.get("message_id"))
             for msg_id in new_info.get("pending_delete_message_ids") or set():
                 self._remember_pending_delete(old_info, msg_id)
@@ -1429,6 +1580,70 @@ class TelegramFS(pyfuse3.Operations):
                 return False
             current = info["parent_inode"]
         return False
+
+    async def _rename_symlink(
+        self,
+        inode: int,
+        old_parent: int,
+        old_name: bytes,
+        new_parent: int,
+        new_name: bytes,
+        target_inode: int | None,
+    ):
+        info = self._files[inode]
+        if info.get("read_only", False):
+            raise FUSEError(errno.EPERM)
+
+        target_info = None
+        if target_inode is not None and target_inode != inode:
+            target_info = self._files[target_inode]
+            if target_info.get("kind") == "directory":
+                raise FUSEError(errno.EISDIR)
+
+        msg, file_id = await self._upload_symlink_marker(
+            new_parent, new_name, info["target"]
+        )
+        delete_ids = set(info.get("pending_delete_message_ids") or set())
+        if info.get("message_id"):
+            delete_ids.add(info["message_id"])
+        if target_info:
+            await self._cancel_delayed_upload_task(target_inode)
+            await self._cancel_active_upload_tasks(target_inode)
+            if target_info.get("message_id"):
+                delete_ids.add(target_info["message_id"])
+            delete_ids.update(target_info.get("pending_delete_message_ids") or set())
+
+        self._name_to_inode.pop((old_parent, old_name), None)
+        if target_info:
+            self._name_to_inode.pop((new_parent, new_name), None)
+            old_target_msg = target_info.get("message_id")
+            if old_target_msg:
+                self._msg_id_to_inode.pop(old_target_msg, None)
+            target_info["unlinked"] = True
+            self._remove_spool(target_info)
+            if target_info.get("refcount", 0) == 0:
+                self._files.pop(target_inode, None)
+
+        old_msg_id = info.get("message_id")
+        if old_msg_id:
+            self._msg_id_to_inode.pop(old_msg_id, None)
+        info.update(
+            message_id=msg.id,
+            file_id=file_id,
+            file_name=new_name,
+            parent_inode=new_parent,
+            timestamp=int(time.time()),
+            pending_delete_message_ids=set(),
+        )
+        self._name_to_inode[(new_parent, new_name)] = inode
+        self._msg_id_to_inode[msg.id] = inode
+
+        try:
+            for msg_id in sorted(delete_ids - {msg.id}):
+                await self._delete_remote_message(msg_id)
+        except Exception as exc:
+            info["read_only"] = True
+            raise FUSEError(errno.EIO) from exc
 
     async def _rename_directory(
         self,
@@ -1577,8 +1792,38 @@ class TelegramFS(pyfuse3.Operations):
     async def link(self, *args, **kwargs):
         raise FUSEError(errno.ENOSYS)
 
-    async def symlink(self, *args, **kwargs):
-        raise FUSEError(errno.ENOSYS)
+    async def symlink(self, parent_inode, name, target, ctx):
+        if self.read_only:
+            raise FUSEError(errno.EROFS)
+        self._directory_id_for_parent(parent_inode)
+        if (parent_inode, name) in self._name_to_inode:
+            raise FUSEError(errno.EEXIST)
+        if not target or len(target) > 384 or b"\0" in target:
+            raise FUSEError(errno.ENAMETOOLONG)
+
+        msg, file_id = await self._upload_symlink_marker(
+            parent_inode, name, target
+        )
+        inode = self._next_inode
+        self._next_inode += 1
+        self._files[inode] = self._new_symlink_info(
+            message_id=msg.id,
+            file_id=file_id,
+            file_name=name,
+            parent_inode=parent_inode,
+            target=target,
+        )
+        self._name_to_inode[(parent_inode, name)] = inode
+        self._msg_id_to_inode[msg.id] = inode
+        return await self.getattr(inode)
+
+    async def readlink(self, inode, ctx):
+        info = self._files.get(inode)
+        if not info or info.get("unlinked"):
+            raise FUSEError(errno.ENOENT)
+        if info.get("kind") != "symlink":
+            raise FUSEError(errno.EINVAL)
+        return info["target"]
 
     async def flush(self, fh: pyfuse3.FileHandleT) -> None:
         inode = self._fh_to_inode.get(fh)

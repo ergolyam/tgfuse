@@ -7,6 +7,7 @@ FILE_MEDIA_FIELDS = ("document", "video", "audio", "animation")
 TGFS_CAPTION_PREFIX = "tgfuse:v1:"
 ROOT_DIRECTORY_ID = "root"
 DIRECTORY_MARKER_NAME = ".tgfuse-directory"
+SYMLINK_MARKER_NAME = ".tgfuse-symlink"
 
 
 def _encode_name(name: bytes) -> str:
@@ -22,6 +23,17 @@ def _decode_name(value: str) -> bytes | None:
     if not name or len(name) > 255 or b"/" in name or b"\0" in name:
         return None
     return name
+
+
+def _decode_target(value: str) -> bytes | None:
+    try:
+        padding = "=" * (-len(value) % 4)
+        target = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (ValueError, TypeError):
+        return None
+    if not target or len(target) > 384 or b"\0" in target:
+        return None
+    return target
 
 
 def _valid_directory_id(value) -> bool:
@@ -55,6 +67,19 @@ def build_directory_caption(directory_id: str, parent_id: str, name: bytes) -> s
     )
 
 
+def build_symlink_caption(parent_id: str, name: bytes, target: bytes) -> str:
+    return TGFS_CAPTION_PREFIX + json.dumps(
+        {
+            "name": _encode_name(name),
+            "parent": parent_id,
+            "target": _encode_name(target),
+            "type": "symlink",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def parse_tgfs_caption(caption) -> dict | None:
     if not isinstance(caption, str) or not caption.startswith(TGFS_CAPTION_PREFIX):
         return None
@@ -67,6 +92,17 @@ def parse_tgfs_caption(caption) -> dict | None:
 
     if value.get("type") == "file":
         return {"kind": "file", "parent_id": value["parent"]}
+    if value.get("type") == "symlink":
+        name = _decode_name(value.get("name"))
+        target = _decode_target(value.get("target"))
+        if name is None or target is None:
+            return None
+        return {
+            "kind": "symlink",
+            "parent_id": value["parent"],
+            "name": name,
+            "target": target,
+        }
     if value.get("type") != "directory" or value.get("id") == ROOT_DIRECTORY_ID:
         return None
     if not _valid_directory_id(value.get("id")):
