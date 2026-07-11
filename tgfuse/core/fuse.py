@@ -36,6 +36,7 @@ pyfuse3.asyncio.enable()
 log = logging_config.setup_logging(__name__)
 
 BOT_DELETE_MAX_AGE = 48 * 60 * 60
+UNMANAGED_DIRECTORY_NAME = b"unmanaged"
 
 
 class TelegramFS(pyfuse3.Operations):
@@ -62,7 +63,8 @@ class TelegramFS(pyfuse3.Operations):
         self.supports_dot_lookup = False
 
         self._root_inode = ROOT_INODE
-        self._next_inode = 2
+        self._unmanaged_inode = 2
+        self._next_inode = 3
 
         self._name_to_inode: dict[tuple[int, bytes], int] = {}
         self._directory_id_to_inode: dict[str, int] = {}
@@ -70,6 +72,10 @@ class TelegramFS(pyfuse3.Operations):
         self._suppressed_msg_ids: set[int] = set()
         self._pending_remote_delete_msg_ids: set[int] = set()
         self._files: dict[int, dict] = {}
+        self._files[self._unmanaged_inode] = self._new_unmanaged_directory_info()
+        self._name_to_inode[
+            (self._root_inode, UNMANAGED_DIRECTORY_NAME)
+        ] = self._unmanaged_inode
 
         self._delayed_upload_tasks: dict[int, asyncio.Task] = {}
         self._active_upload_tasks: dict[int, set[asyncio.Task]] = {}
@@ -174,7 +180,7 @@ class TelegramFS(pyfuse3.Operations):
         )
         log.info(
             "Initial sync done, loaded %s entries (%s bot-expired read-only).",
-            len(self._files),
+            len(self._files) - 1,
             bot_expired,
         )
 
@@ -237,13 +243,19 @@ class TelegramFS(pyfuse3.Operations):
             return self._root_inode
         return self._directory_id_to_inode.get(directory_id, self._root_inode)
 
-    def _directory_id_for_parent(self, parent_inode: int) -> str:
+    def _directory_id_for_parent(self, parent_inode: int) -> str | None:
         if parent_inode == self._root_inode:
             return ROOT_DIRECTORY_ID
+        if parent_inode == self._unmanaged_inode:
+            return None
         info = self._files.get(parent_inode)
         if not info or info.get("kind") != "directory":
             raise FUSEError(errno.ENOTDIR)
         return info["directory_id"]
+
+    def _file_caption_for_parent(self, parent_inode: int) -> str:
+        parent_id = self._directory_id_for_parent(parent_inode)
+        return "" if parent_id is None else build_file_caption(parent_id)
 
     def _ensure_writable_directory(self, inode: int):
         if self.read_only:
@@ -350,8 +362,11 @@ class TelegramFS(pyfuse3.Operations):
                 timestamp=ts,
             )
         else:
-            parent_id = metadata["parent_id"] if metadata else ROOT_DIRECTORY_ID
-            parent_inode = self._parent_inode_for_id(parent_id)
+            parent_inode = (
+                self._parent_inode_for_id(metadata["parent_id"])
+                if metadata
+                else self._unmanaged_inode
+            )
             name = self._unique_file_name(parent_inode, fname_b)
             inode = self._next_inode
             self._next_inode += 1
@@ -530,6 +545,26 @@ class TelegramFS(pyfuse3.Operations):
             "pending_delete_message_ids": set(),
             "unlinked": False,
             "mode": 0o755,
+        }
+
+    def _new_unmanaged_directory_info(self) -> dict:
+        return {
+            "message_id": None,
+            "kind": "directory",
+            "file_id": None,
+            "file_name": UNMANAGED_DIRECTORY_NAME,
+            "parent_inode": self._root_inode,
+            "size": 0,
+            "timestamp": int(time.time()),
+            "remote_timestamp": None,
+            "dirty": False,
+            "refcount": 0,
+            "read_only": False,
+            "read_only_reason": None,
+            "pending_delete_message_ids": set(),
+            "unlinked": False,
+            "mode": 0o755,
+            "synthetic_unmanaged": True,
         }
 
     def _new_symlink_info(
@@ -1152,7 +1187,6 @@ class TelegramFS(pyfuse3.Operations):
             pending_delete = set(info.get("pending_delete_message_ids") or set())
             change_id = info.get("change_id", 0)
             file_name = self._file_name_text(info)
-            parent_id = self._directory_id_for_parent(info["parent_inode"])
             source_file_id = info.get("file_id") if not path else None
             original_message_id = info.get("message_id")
             delete_after_upload = set(pending_delete)
@@ -1215,7 +1249,7 @@ class TelegramFS(pyfuse3.Operations):
                         snapshot_path,
                         file_name,
                         size,
-                        caption=build_file_caption(parent_id),
+                        caption=self._file_caption_for_parent(info["parent_inode"]),
                     )
 
                 msg = await self._retry_flood_wait(
@@ -1663,7 +1697,15 @@ class TelegramFS(pyfuse3.Operations):
         if flags & pyfuse3.RENAME_NOREPLACE and new_inode is not None:
             raise FUSEError(errno.EEXIST)
 
+        if old_inode == self._unmanaged_inode or new_inode == self._unmanaged_inode:
+            raise FUSEError(errno.EPERM)
+
         old_info = self._files[old_inode]
+        if (
+            parent_inode_new == self._unmanaged_inode
+            and old_info.get("kind") != "file"
+        ):
+            raise FUSEError(errno.EPERM)
         if self._entry_is_read_only(old_info):
             raise FUSEError(errno.EPERM)
         if (
@@ -1939,6 +1981,20 @@ class TelegramFS(pyfuse3.Operations):
             return await self.getattr(inode)
         if inode not in self._files:
             raise FUSEError(errno.ENOENT)
+        if inode == self._unmanaged_inode:
+            if any(
+                (
+                    fields.update_size,
+                    fields.update_mode,
+                    fields.update_uid,
+                    fields.update_gid,
+                    fields.update_atime,
+                    fields.update_mtime,
+                    fields.update_ctime,
+                )
+            ):
+                raise FUSEError(errno.EPERM)
+            return await self.getattr(inode)
 
         info = self._files[inode]
         if self.read_only or self._entry_is_read_only(info):
@@ -1965,6 +2021,8 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
         self._ensure_writable_directory(parent_inode)
+        if parent_inode == self._unmanaged_inode:
+            raise FUSEError(errno.EPERM)
         if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
 
@@ -1996,6 +2054,8 @@ class TelegramFS(pyfuse3.Operations):
         info = self._files[inode]
         if info.get("kind") != "directory":
             raise FUSEError(errno.ENOTDIR)
+        if inode == self._unmanaged_inode:
+            raise FUSEError(errno.EPERM)
         if self._directory_not_empty(inode):
             raise FUSEError(errno.ENOTEMPTY)
         if self._entry_is_read_only(info):
@@ -2021,6 +2081,8 @@ class TelegramFS(pyfuse3.Operations):
             raise FUSEError(errno.EROFS)
         self._directory_id_for_parent(parent_inode)
         self._ensure_writable_directory(parent_inode)
+        if parent_inode == self._unmanaged_inode:
+            raise FUSEError(errno.EPERM)
         if (parent_inode, name) in self._name_to_inode:
             raise FUSEError(errno.EEXIST)
         if not target or len(target) > 384 or b"\0" in target:

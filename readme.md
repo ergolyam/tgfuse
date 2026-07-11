@@ -50,6 +50,7 @@ python -m venv .venv
 - **Read-only or read/write**: If you have permissions to send messages in the specified chat/channel, the filesystem will act in read-write mode. Otherwise, it automatically becomes read-only.
 - **Automatic synchronization**: Periodically checks for new/removed files in the Telegram chat and updates the mounted filesystem accordingly.
 - **Persistent directories**: Nested and empty directories are restored from versioned metadata stored in Telegram document captions.
+- **Unmanaged compatibility directory**: The permanent root-level `unmanaged/` directory contains Telegram documents without valid `tgfuse:v1:` metadata. Files written there are uploaded without a tgfuse caption for compatibility with the original flat filesystem.
 - **Lazy streamed downloads**: Files are read from Telegram on demand with bounded read-ahead for sequential media playback.
 - **On-demand uploads**: When creating or modifying files, they are uploaded back to the Telegram chat. Removing a file cancels its pending or active upload, including queued large-file chunks.
 - **Multiple Client Support**: Enjoy the flexibility to connect to Telegram in two distinct ways.
