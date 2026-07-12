@@ -5,7 +5,6 @@ class Config:
     tg_id: str = ''
     tg_hash: str = ''
     tg_token: str = ''
-    ftp: bool = False
     chat_id: int = 0
     tg_upload_workers: int = 4
     tg_upload_buffer_parts: int = 16

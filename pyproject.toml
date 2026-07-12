@@ -5,7 +5,6 @@ description = "Tg UserBot that allows you to mount a telegram channel as a drive
 readme = "readme.md"
 requires-python = ">=3.12"
 dependencies = [
-    "pyftpdlib>=2.0.1",
     "pyfuse3>=3.4.0",
     "pyrofork>=2.3.58",
     "tgcrypto-pyrofork>=1.2.7",

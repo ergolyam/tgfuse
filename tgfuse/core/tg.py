@@ -24,11 +24,6 @@ async def init():
         sys.exit(1)
 
     mount = sys.argv[1]
-    if Config.ftp:
-        import threading
-        from tgfuse.core.ftp import ftp_server
-        ftp_thread = threading.Thread(target=ftp_server, args=(mount,), daemon=True)
-        ftp_thread.start()
 
     api_id = int(api_id)
     if Config.tg_token:

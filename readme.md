@@ -41,7 +41,6 @@ python -m venv .venv
     CHAT_ID="your_channel_id"
     TG_UPLOAD_WORKERS="4" # parallel Telegram upload workers for large files
     TG_UPLOAD_BUFFER_PARTS="16" # queued 512 KiB upload parts kept in memory
-    FTP="True" # very unstable, not recommended at the moment
     ```
 
 ### Features
